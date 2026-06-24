@@ -1,0 +1,1 @@
+"The game works, but there is a bug in the collision detection. When the player jumps and lands on top of the enemy, the player should kill the enemy and bounce up slightly. Currently, the player dies even when hitting the enemy from the top. Please fix the collision logic to check the Y-velocity and position to determine if it's a stomp. Also, make the jump height a bit higher."

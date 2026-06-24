@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Super Qwen Bros</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+  .wrap { position: relative; }
+  canvas { display: block; image-rendering: pixelated; border: 2px solid #333; }
+  #muteBtn {
+    position: absolute; top: 8px; right: 8px;
+    background: rgba(0,0,0,0.55); color: #fff;
+    border: 1px solid #666; border-radius: 4px;
+    padding: 4px 10px; font: bold 13px monospace;
+    cursor: pointer; user-select: none;
+  }
+  #muteBtn:hover { background: rgba(0,0,0,0.8); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="game"></canvas>
+  <button id="muteBtn" title="Toggle music">🔊 Music</button>
+</div>
+<script>
+// ── Constants ──────────────────────────────────────────────
+const CANVAS_W = 800;
+const CANVAS_H = 480;
+const TILE = 32;
+const GRAVITY = 0.55;
+const PLAYER_SPEED = 3.5;
+const JUMP_FORCE = -11;
+const ENEMY_SPEED = 1.2;
+const LEVEL_WIDTH = 200;  // in tiles
+const LEVEL_HEIGHT = 15;  // in tiles
+
+// ── Canvas Setup ───────────────────────────────────────────
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+canvas.width = CANVAS_W;
+canvas.height = CANVAS_H;
+
+// ── Input ──────────────────────────────────────────────────
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ── Sound (Web Audio API, 8-bit synth) ─────────────────────
+class SoundManager {
+  constructor() {
+    try {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (e) {
+      this.ctx = null; // no audio support — silently no-op
+    }
+    this.masterGain = null;
+    this._bgmBufferPromise = null;
+    this._bgmSource = null;
+    this._bgmGain = null;
+    this.muted = false;
+
+    if (this.ctx) {
+      this.masterGain = this.ctx.createGain();
+      this.masterGain.gain.value = 0.25;
+      this.masterGain.connect(this.ctx.destination);
+
+      // Dedicated BGM bus so it can be muted independently of SFX
+      this._bgmGain = this.ctx.createGain();
+      this._bgmGain.gain.value = 1;
+      this._bgmGain.connect(this.masterGain);
+
+      // Resume AudioContext on first user gesture (browser autoplay policy)
+      const resume = () => {
+        if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+      };
+      window.addEventListener('keydown', resume, { once: false });
+      window.addEventListener('mousedown', resume, { once: false });
+
+      // Pre-render the loopable 8-bar BGM into an AudioBuffer
+      this._bgmBufferPromise = this._renderBGMBuffer();
+    }
+  }
+
+  // ── SFX helpers ────────────────────────────────────────
+  _tone({ type = 'square', freq = 440, duration = 0.1, volume = 1, startTime = 0, freqEnd = null }) {
+    if (!this.ctx) return;
+    const t0 = this.ctx.currentTime + startTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    if (freqEnd !== null) {
+      osc.frequency.exponentialRampToValueAtTime(Math.max(freqEnd, 0.0001), t0 + duration);
+    }
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(volume, t0 + 0.005);
+    gain.gain.linearRampToValueAtTime(volume * 0.8, t0 + duration * 0.7);
+    gain.gain.linearRampToValueAtTime(0, t0 + duration);
+    osc.connect(gain);
+    gain.connect(this.masterGain);
+    osc.start(t0);
+    osc.stop(t0 + duration + 0.02);
+  }
+  jump()  { this._tone({ type: 'square', freq: 330, freqEnd: 660, duration: 0.14, volume: 0.6 }); }
+  coin()  {
+    this._tone({ type: 'square', freq: 988,  duration: 0.06, volume: 0.5, startTime: 0 });
+    this._tone({ type: 'square', freq: 1319, duration: 0.14, volume: 0.5, startTime: 0.06 });
+  }
+  stomp() { this._tone({ type: 'sine', freq: 200, freqEnd: 60, duration: 0.12, volume: 0.7 }); }
+  death() { this._tone({ type: 'square', freq: 440, freqEnd: 80, duration: 0.55, volume: 0.7 }); }
+  win()   {
+    const notes = [523, 659, 784, 1047];
+    notes.forEach((f, i) => {
+      this._tone({ type: 'square', freq: f, duration: 0.14, volume: 0.55, startTime: i * 0.12 });
+    });
+  }
+
+  // ── BGM ────────────────────────────────────────────────
+  // Render an 8-bar chiptune loop (square melody + triangle bass)
+  // offline into an AudioBuffer, cache it, and loop it seamlessly.
+  async _renderBGMBuffer() {
+    const BPM = 140;
+    const q = 60 / BPM;           // quarter note (seconds)
+    const e = q / 2;              // eighth note
+    const sampleRate = 44100;
+    const totalEighths = 32;      // 8 bars × 4 beats × 2 eighths = 64... wait = 32 eighths = 8 bars
+    // (4/4 meter ⇒ 8 eighths/bar ⇒ 8 bars × 8 = 64 eighths)
+    const totalDur = 64 * e + 0.2;
+    const off = new OfflineAudioContext(1, Math.ceil(totalDur * sampleRate), sampleRate);
+
+    // Note helper (uses enclosing `off` context)
+    const mkNote = (freq, startSec, durSec, type, vol) => {
+      const o = off.createOscillator();
+      const g = off.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, startSec);
+      g.gain.setValueAtTime(0, startSec);
+      g.gain.linearRampToValueAtTime(vol, startSec + 0.008);
+      g.gain.setValueAtTime(vol, startSec + Math.max(durSec - 0.03, 0.01));
+      g.gain.linearRampToValueAtTime(0.0001, startSec + durSec);
+      o.connect(g);
+      g.connect(off.destination);
+      o.start(startSec);
+      o.stop(startSec + durSec + 0.02);
+    };
+
+    // ── Melody (square wave) ────────────────────────────
+    // 2-bar hook, repeats 4× to make 8 bars.
+    // C5 C5 G5 G5 C6 B5 | A5 G5 F5 E5 (each note = 1 eighth, 8 eighths = 1 bar)
+    const melodyPattern = [
+      // [freq, startEighth, durEighth]
+      [523,  0, 1], [523,  1, 1], [784,  2, 1], [784,  3, 1],
+      [1047, 4, 1], [988,  5, 1], [880,  6, 2],
+      [784,  8, 1], [659,  9, 1], [587, 10, 2], [659, 12, 1], [523, 13, 1],
+      [494, 14, 2],
+    ];
+    for (let r = 0; r < 4; r++) {
+      const off8 = r * 16;
+      for (const [f, s, d] of melodyPattern) {
+        mkNote(f, (off8 + s) * e, d * e, 'square', 0.09);
+      }
+    }
+
+    // ── Bassline (triangle wave) ────────────────────────
+    // Chord progression I–IV–V–I, two bars each:
+    //  bars 1–2: C    bar 3–4: F    bar 5–6: G    bar 7–8: C
+    const bassPattern = [
+      // [freq, startEighth]
+      [130.81,  0], [130.81,  8], // C3, bars 1-2
+      [174.61, 16], [174.61, 24], // F3, bars 3-4
+      [196.00, 32], [196.00, 40], // G3, bars 5-6
+      [130.81, 48], [196.00, 56], // C3 then G3 (V→I turnaround), bars 7-8
+    ];
+    for (const [f, s8] of bassPattern) {
+      mkNote(f, s8 * e, 6 * e, 'triangle', 0.18);
+    }
+
+    return off.startRendering();
+  }
+
+  playBGM() {
+    if (!this.ctx || !this._bgmBufferPromise) return;
+    if (this._bgmSource) return; // already running
+    this._bgmBufferPromise.then(buf => {
+      if (!buf || this._bgmSource) return;
+      const src = this.ctx.createBufferSource();
+      src.buffer = buf;
+      src.loop = true;
+      src.connect(this._bgmGain);
+      src.start(0);
+      this._bgmSource = src;
+    });
+  }
+
+  stopBGM() {
+    if (this._bgmSource) {
+      try { this._bgmSource.stop(); } catch (_) {}
+      this._bgmSource.disconnect();
+      this._bgmSource = null;
+    }
+  }
+
+  setBGMMuted(muted) {
+    this.muted = muted;
+    if (this._bgmGain) {
+      this._bgmGain.gain.cancelScheduledValues(this.ctx.currentTime);
+      this._bgmGain.gain.setTargetAtTime(muted ? 0 : 1, this.ctx.currentTime, 0.05);
+    }
+  }
+}
+
+// ── Helper ─────────────────────────────────────────────────
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// ── Juice: Particle ────────────────────────────────────────
+class Particle {
+  constructor(x, y, color) {
+    this.x = x; this.y = y;
+    this.vx = (Math.random() - 0.5) * 7;
+    this.vy = -Math.random() * 6 - 2;
+    this.life = 28 + Math.random() * 18;
+    this.maxLife = this.life;
+    this.size = 2 + Math.random() * 3;
+    this.color = color;
+  }
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.vy += 0.28;
+    this.vx *= 0.97;
+    this.life--;
+  }
+  draw(ctx, cam) {
+    const alpha = Math.max(0, this.life / this.maxLife);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = this.color;
+    ctx.fillRect(this.x - cam.x - this.size / 2, this.y - cam.y - this.size / 2, this.size, this.size);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ── Sprite classes ─────────────────────────────────────────
+
+class Platform {
+  constructor(x, y, w, h, type = 'brick') {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.type = type; // 'ground' | 'brick'
+  }
+  draw(ctx, cam) {
+    const sx = this.x - cam.x;
+    const sy = this.y - cam.y;
+    if (sx + this.w < 0 || sx > CANVAS_W) return; // cull offscreen
+    if (this.type === 'ground') {
+      ctx.fillStyle = '#5a8f29';
+      ctx.fillRect(sx, sy, this.w, 4);
+      ctx.fillStyle = '#8B4513';
+      ctx.fillRect(sx, sy + 4, this.w, this.h - 4);
+      // texture lines
+      ctx.strokeStyle = '#6B3410';
+      for (let tx = 0; tx < this.w; tx += TILE) {
+        ctx.strokeRect(sx + tx + 0.5, sy + 4.5, TILE - 1, this.h - 5);
+      }
+    } else {
+      ctx.fillStyle = '#c84c09';
+      ctx.fillRect(sx, sy, this.w, this.h);
+      ctx.strokeStyle = '#9e3a06';
+      ctx.lineWidth = 1;
+      // brick pattern
+      for (let by = 0; by < this.h; by += 16) {
+        const offset = (by / 16) % 2 === 0 ? 0 : 16;
+        for (let bx = offset; bx < this.w; bx += 32) {
+          ctx.strokeRect(sx + bx + 0.5, sy + by + 0.5, 31, 15);
+        }
+      }
+    }
+  }
+}
+
+class Coin {
+  constructor(x, y) {
+    this.x = x; this.y = y; this.w = 20; this.h = 20;
+    this.collected = false;
+    this.bobOffset = Math.random() * Math.PI * 2;
+  }
+  update(tick) {
+    this.drawY = this.y + Math.sin((tick + this.bobOffset) * 0.06) * 4;
+  }
+  draw(ctx, cam, tick) {
+    if (this.collected) return;
+    this.update(tick);
+    const sx = this.x - cam.x;
+    const sy = this.drawY - cam.y;
+    if (sx + this.w < 0 || sx > CANVAS_W) return;
+    // coin body
+    ctx.fillStyle = '#FFD700';
+    ctx.beginPath();
+    ctx.ellipse(sx + this.w / 2, sy + this.h / 2, this.w / 2, this.h / 2, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#DAA520';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // inner shine
+    ctx.fillStyle = '#FFF8A0';
+    ctx.beginPath();
+    ctx.ellipse(sx + this.w / 2 - 3, sy + this.h / 2 - 3, 4, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+class Enemy {
+  constructor(x, y, patrolLeft, patrolRight) {
+    this.x = x; this.y = y; this.w = 28; this.h = 28;
+    this.vx = ENEMY_SPEED;
+    this.patrolLeft = patrolLeft;
+    this.patrolRight = patrolRight;
+    this.alive = true;
+    this.squishTimer = 0;
+  }
+  update(platforms) {
+    if (!this.alive) {
+      this.squishTimer--;
+      return;
+    }
+    this.x += this.vx;
+    // patrol bounds
+    if (this.x <= this.patrolLeft) { this.x = this.patrolLeft; this.vx = ENEMY_SPEED; }
+    if (this.x + this.w >= this.patrolRight) { this.x = this.patrolRight - this.w; this.vx = -ENEMY_SPEED; }
+
+    // simple gravity — snap to platform below
+    let onPlatform = false;
+    for (const p of platforms) {
+      if (this.x + this.w > p.x && this.x < p.x + p.w &&
+          this.y + this.h >= p.y && this.y + this.h <= p.y + 8) {
+        this.y = p.y - this.h;
+        onPlatform = true;
+      }
+    }
+    if (!onPlatform) this.y += 3; // crude gravity for enemies
+  }
+  draw(ctx, cam) {
+    if (!this.alive && this.squishTimer <= 0) return;
+    const sx = this.x - cam.x;
+    const sy = this.y - cam.y;
+    if (sx + this.w < -50 || sx > CANVAS_W + 50) return;
+
+    if (!this.alive) {
+      // squished
+      ctx.fillStyle = '#4466cc';
+      ctx.fillRect(sx, sy + this.h - 8, this.w, 8);
+      return;
+    }
+    // body
+    ctx.fillStyle = '#4477DD';
+    ctx.fillRect(sx, sy, this.w, this.h);
+    // darker bottom
+    ctx.fillStyle = '#3355AA';
+    ctx.fillRect(sx, sy + this.h * 0.6, this.w, this.h * 0.4);
+    // eyes
+    ctx.fillStyle = '#fff';
+    const eyeOff = this.vx > 0 ? 4 : -2;
+    ctx.fillRect(sx + 6 + eyeOff, sy + 6, 6, 8);
+    ctx.fillRect(sx + 16 + eyeOff, sy + 6, 6, 8);
+    ctx.fillStyle = '#111';
+    ctx.fillRect(sx + 8 + eyeOff, sy + 9, 3, 4);
+    ctx.fillRect(sx + 18 + eyeOff, sy + 9, 3, 4);
+    // feet
+    ctx.fillStyle = '#333';
+    ctx.fillRect(sx + 2, sy + this.h - 4, 8, 4);
+    ctx.fillRect(sx + this.w - 10, sy + this.h - 4, 8, 4);
+  }
+}
+
+class Flag {
+  constructor(x, y) {
+    this.x = x; this.y = y; this.w = 8; this.h = TILE * 4;
+  }
+  draw(ctx, cam) {
+    const sx = this.x - cam.x;
+    const sy = this.y - cam.y;
+    // pole
+    ctx.fillStyle = '#888';
+    ctx.fillRect(sx, sy, this.w, this.h);
+    // flag
+    ctx.fillStyle = '#22CC44';
+    ctx.beginPath();
+    ctx.moveTo(sx + this.w, sy + 4);
+    ctx.lineTo(sx + this.w + 40, sy + 20);
+    ctx.lineTo(sx + this.w, sy + 36);
+    ctx.closePath();
+    ctx.fill();
+    // ball on top
+    ctx.fillStyle = '#FFD700';
+    ctx.beginPath();
+    ctx.arc(sx + this.w / 2, sy, 6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+class Player {
+  constructor(x, y, sound = null) {
+    this.x = x; this.y = y; this.w = 26; this.h = 32;
+    this.vx = 0; this.vy = 0;
+    this.onGround = false;
+    this.facing = 1; // 1 = right, -1 = left
+    this.alive = true;
+    this.winTimer = 0;
+    this.sound = sound;
+    this.scaleX = 1; this.scaleY = 1;
+    this.wasOnGround = false;
+  }
+  update(platforms) {
+    if (!this.alive) {
+      this.vy += GRAVITY;
+      this.y += this.vy;
+      return;
+    }
+
+    // Horizontal movement
+    this.vx = 0;
+    if (keys['ArrowLeft'])  { this.vx = -PLAYER_SPEED; this.facing = -1; }
+    if (keys['ArrowRight']) { this.vx = PLAYER_SPEED;  this.facing = 1;  }
+
+    // Jump
+    if ((keys['Space'] || keys['ArrowUp']) && this.onGround) {
+      this.vy = JUMP_FORCE;
+      this.onGround = false;
+      // Juice: stretch when jumping
+      this.scaleX = 0.82; this.scaleY = 1.22;
+      if (this.sound) this.sound.jump();
+    }
+
+    // Gravity
+    this.vy += GRAVITY;
+    if (this.vy > 12) this.vy = 12; // terminal velocity
+
+    // Move X then resolve collisions
+    this.x += this.vx;
+    this.onGround = false;
+    for (const p of platforms) {
+      if (rectsOverlap(this, p)) {
+        if (this.vx > 0) this.x = p.x - this.w;
+        else if (this.vx < 0) this.x = p.x + p.w;
+      }
+    }
+
+    // Move Y then resolve collisions
+    this.y += this.vy;
+    for (const p of platforms) {
+      if (rectsOverlap(this, p)) {
+        if (this.vy > 0) {
+          this.y = p.y - this.h;
+          this.vy = 0;
+          this.onGround = true;
+        } else if (this.vy < 0) {
+          this.y = p.y + p.h;
+          this.vy = 0;
+        }
+      }
+    }
+
+    // Juice: squash on landing (transition from airborne to grounded)
+    if (this.onGround && !this.wasOnGround) {
+      this.scaleX = 1.25; this.scaleY = 0.75;
+    }
+    this.wasOnGround = this.onGround;
+
+    // Juice: decay squash/stretch back to neutral
+    this.scaleX += (1 - this.scaleX) * 0.18;
+    this.scaleY += (1 - this.scaleY) * 0.18;
+
+    // Fall off world
+    if (this.y > LEVEL_HEIGHT * TILE + 100) this.alive = false;
+  }
+  draw(ctx, cam) {
+    const sx = this.x - cam.x;
+    const sy = this.y - cam.y;
+    // Juice: squash & stretch around sprite center
+    const scX = this.scaleX, scY = this.scaleY;
+    const cx = sx + this.w / 2;
+    const cy = sy + this.h / 2;
+    const drawX = cx - (this.w / 2) * scX;
+    const drawY = cy - (this.h / 2) * scY;
+    const dw = this.w * scX;
+    const dh = this.h * scY;
+    // body
+    ctx.fillStyle = this.alive ? '#DD2222' : '#771111';
+    ctx.fillRect(drawX, drawY, dw, dh);
+    // cap brim
+    ctx.fillStyle = '#BB1111';
+    ctx.fillRect(drawX - 2 * scX, drawY, dw + 4 * scX, 8 * scY);
+    // eyes
+    if (this.alive) {
+      ctx.fillStyle = '#fff';
+      const ex = this.facing > 0 ? 12 * scX : 4 * scX;
+      ctx.fillRect(drawX + ex, drawY + 10 * scY, 6 * scX, 6 * scY);
+      ctx.fillStyle = '#111';
+      ctx.fillRect(drawX + ex + (this.facing > 0 ? 2 * scX : 1 * scX), drawY + 12 * scY, 3 * scX, 3 * scY);
+    }
+    // feet
+    ctx.fillStyle = '#882200';
+    ctx.fillRect(drawX + 2 * scX, drawY + dh - 5 * scY, 8 * scX, 5 * scY);
+    ctx.fillRect(drawX + dw - 10 * scX, drawY + dh - 5 * scY, 8 * scX, 5 * scY);
+  }
+}
+
+// ── Game class ─────────────────────────────────────────────
+class Game {
+  constructor(sound = null) {
+    this.sound = sound;
+    this.state = 'playing'; // 'playing' | 'dead' | 'win'
+    this.prevState = 'playing';
+    this.tick = 0;
+    this.score = 0;
+    this.camera = { x: 0, y: 0 };
+    this.particles = [];
+    this.shakeIntensity = 0;
+    this.shakeTimer = 0;
+    this.buildLevel();
+    if (this.sound) this.sound.playBGM();
+  }
+
+  buildLevel() {
+    const T = TILE;
+    this.platforms = [];
+    this.enemies = [];
+    this.coins = [];
+
+    // ── ground ──
+    const groundSections = [
+      [0, 35],  // tiles 0-34
+      [38, 55], // gap at 35-37
+      [58, 90], // gap at 55-57
+      [93, LEVEL_WIDTH], // gap at 90-92
+    ];
+    for (const [s, e] of groundSections) {
+      this.platforms.push(new Platform(s * T, (LEVEL_HEIGHT - 1) * T, (e - s) * T, T * 1, 'ground'));
+    }
+
+    // ── floating brick platforms ──
+    const bricks = [
+      // [tileX, tileY, widthInTiles]
+      [8,  10, 4],
+      [14, 8,  3],
+      [20, 10, 5],
+      [28, 7,  3],
+      [33, 9,  2],
+      [36, 11, 2],  // above first gap
+      [42, 9,  4],
+      [48, 7,  3],
+      [53, 10, 3],
+      [56, 11, 2],  // above second gap
+      [62, 10, 4],
+      [68, 8,  3],
+      [73, 6,  4],
+      [78, 10, 3],
+      [82, 8,  2],
+      [85, 6,  3],
+      [90, 11, 3],  // above third gap
+      [95, 9,  4],
+      [102, 7, 3],
+      [108, 10, 5],
+      [115, 8, 3],
+      [120, 6, 4],
+      [126, 9, 3],
+      [132, 7, 4],
+      [140, 10, 5],
+      [148, 8, 3],
+      [155, 6, 4],
+    ];
+    for (const [bx, by, bw] of bricks) {
+      this.platforms.push(new Platform(bx * T, by * T, bw * T, T, 'brick'));
+    }
+
+    // ── enemies ──
+    const enemyPositions = [
+      [10 * T, (LEVEL_HEIGHT - 2) * T, 8 * T, 18 * T],
+      [22 * T, (LEVEL_HEIGHT - 2) * T, 20 * T, 30 * T],
+      [44 * T, (LEVEL_HEIGHT - 2) * T, 38 * T, 54 * T],
+      [64 * T, (LEVEL_HEIGHT - 2) * T, 58 * T, 74 * T],
+      [80 * T, (LEVEL_HEIGHT - 2) * T, 75 * T, 88 * T],
+      // on platforms
+      [21 * T, 10 * T - 28, 20 * T, 25 * T],
+      [43 * T, 9 * T - 28, 42 * T, 46 * T],
+      [73 * T, 6 * T - 28, 73 * T, 77 * T],
+      [109 * T, 10 * T - 28, 108 * T, 113 * T],
+      [141 * T, 10 * T - 28, 140 * T, 145 * T],
+      // more ground enemies
+      [100 * T, (LEVEL_HEIGHT - 2) * T, 95 * T, 120 * T],
+      [130 * T, (LEVEL_HEIGHT - 2) * T, 125 * T, 145 * T],
+    ];
+    for (const [ex, ey, pl, pr] of enemyPositions) {
+      this.enemies.push(new Enemy(ex, ey, pl, pr));
+    }
+
+    // ── coins ──
+    const coinPositions = [
+      [9, 9], [10, 9], [11, 9],
+      [15, 7], [16, 7],
+      [21, 9], [22, 9], [23, 9],
+      [29, 6], [30, 6],
+      [36, 10],
+      [43, 8], [44, 8],
+      [49, 6], [50, 6],
+      [56, 10],
+      [63, 9], [64, 9],
+      [69, 7], [70, 7],
+      [74, 5], [75, 5],
+      [79, 9],
+      [90, 10],
+      [96, 8], [97, 8],
+      [103, 6], [104, 6],
+      [109, 9], [110, 9], [111, 9],
+      [116, 7], [117, 7],
+      [121, 5], [122, 5], [123, 5],
+      [127, 8], [128, 8],
+      [133, 6], [134, 6],
+      [141, 9], [142, 9], [143, 9],
+      [149, 7], [150, 7],
+      [156, 5], [157, 5],
+      // ground trail coins
+      [5,13],[6,13],[7,13],
+      [40,13],[41,13],[42,13],
+      [60,13],[61,13],
+      [95,13],[96,13],[97,13],
+      [135,13],[136,13],[137,13],
+    ];
+    for (const [cx, cy] of coinPositions) {
+      this.coins.push(new Coin(cx * T + 6, cy * T + 6));
+    }
+
+    // ── flag ──
+    this.flag = new Flag(160 * T, (LEVEL_HEIGHT - 5) * T);
+
+    // ── player ──
+    this.player = new Player(3 * T, (LEVEL_HEIGHT - 3) * T, this.sound);
+  }
+
+  update() {
+    this.tick++;
+
+    // Juice: decay screen shake
+    if (this.shakeTimer > 0) this.shakeTimer--;
+    else this.shakeIntensity *= 0.85;
+
+    // Juice: update particles
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      this.particles[i].update();
+      if (this.particles[i].life <= 0) this.particles.splice(i, 1);
+    }
+
+    // Handle state transitions: stop BGM once when leaving 'playing'
+    if (this.state !== this.prevState) {
+      if (this.state === 'dead' || this.state === 'win') {
+        if (this.sound) this.sound.stopBGM();
+      }
+      this.prevState = this.state;
+    }
+
+    if (this.state === 'dead') {
+      this.player.update(this.platforms);
+      if (keys['KeyR']) this.restart();
+      return;
+    }
+    if (this.state === 'win') {
+      if (keys['KeyR']) this.restart();
+      return;
+    }
+
+    this.player.update(this.platforms);
+
+    // Enemies
+    for (const e of this.enemies) {
+      e.update(this.platforms);
+    }
+
+    // Player vs enemies
+    if (this.player.alive) {
+      for (const e of this.enemies) {
+        if (!e.alive) continue;
+        if (rectsOverlap(this.player, e)) {
+          // stomp check: player falling and feet above enemy center
+          if (this.player.vy > 0 && this.player.y + this.player.h < e.y + e.h * 0.6) {
+            e.alive = false;
+            e.squishTimer = 30;
+            this.player.vy = JUMP_FORCE * 0.6;
+            this.score += 100;
+            if (this.sound) this.sound.stomp();
+            // Juice: burst of particles from squished enemy + screen shake
+            for (let k = 0; k < 10; k++) {
+              this.particles.push(new Particle(e.x + e.w / 2, e.y + e.h / 2,
+                ['#4477DD','#3355AA','#8ab4ff','#ffffff'][k % 4]));
+            }
+            this.shakeIntensity = 8;
+            this.shakeTimer = 8;
+          } else {
+            this.player.alive = false;
+            this.player.vy = JUMP_FORCE;
+            this.state = 'dead';
+            if (this.sound) this.sound.death();
+            // Juice: bigger shake + red particle burst on death
+            for (let k = 0; k < 14; k++) {
+              this.particles.push(new Particle(this.player.x + this.player.w / 2,
+                this.player.y + this.player.h / 2,
+                ['#DD2222','#FF5544','#ffffff','#ffaaaa'][k % 4]));
+            }
+            this.shakeIntensity = 14;
+            this.shakeTimer = 18;
+          }
+        }
+      }
+    }
+
+    // Player vs coins
+    for (const c of this.coins) {
+      if (c.collected) continue;
+      c.update(this.tick);
+      const cRect = { x: c.x, y: c.drawY, w: c.w, h: c.h };
+      if (rectsOverlap(this.player, cRect)) {
+        c.collected = true;
+        this.score += 50;
+        if (this.sound) this.sound.coin();
+        // Juice: yellow sparkle burst from coin
+        for (let k = 0; k < 8; k++) {
+          this.particles.push(new Particle(c.x + c.w / 2, c.drawY + c.h / 2,
+            ['#FFD700','#FFF8A0','#FFE55C','#ffffff'][k % 4]));
+        }
+      }
+    }
+
+    // Player vs flag
+    if (this.player.alive && rectsOverlap(this.player, this.flag)) {
+      this.state = 'win';
+      if (this.sound) this.sound.win();
+    }
+
+    // Camera — follows player smoothly
+    const targetX = this.player.x - CANVAS_W * 0.35;
+    const targetY = this.player.y - CANVAS_H * 0.5;
+    this.camera.x += (targetX - this.camera.x) * 0.1;
+    this.camera.y += (targetY - this.camera.y) * 0.1;
+    this.camera.x = Math.max(0, Math.min(this.camera.x, LEVEL_WIDTH * TILE - CANVAS_W));
+    this.camera.y = Math.max(0, Math.min(this.camera.y, LEVEL_HEIGHT * TILE - CANVAS_H));
+  }
+
+  draw() {
+    // sky gradient
+    const grad = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
+    grad.addColorStop(0, '#5599FF');
+    grad.addColorStop(0.7, '#AADDFF');
+    grad.addColorStop(1, '#DDEEFF');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    // Juice: screen shake via context translate
+    let shakeX = 0, shakeY = 0;
+    if (this.shakeIntensity > 0.2) {
+      shakeX = (Math.random() - 0.5) * this.shakeIntensity * 2;
+      shakeY = (Math.random() - 0.5) * this.shakeIntensity * 2;
+    }
+    ctx.save();
+    ctx.translate(shakeX, shakeY);
+
+    // parallax clouds
+    this.drawClouds();
+
+    // distant hills (parallax)
+    this.drawHills();
+
+    // platforms
+    for (const p of this.platforms) p.draw(ctx, this.camera);
+
+    // flag
+    this.flag.draw(ctx, this.camera);
+
+    // coins
+    for (const c of this.coins) c.draw(ctx, this.camera, this.tick);
+
+    // enemies
+    for (const e of this.enemies) e.draw(ctx, this.camera);
+
+    // player
+    this.player.draw(ctx, this.camera);
+
+    // Juice: particles (screen-space on top of the world)
+    for (const p of this.particles) p.draw(ctx, this.camera);
+
+    ctx.restore();
+
+    // HUD (drawn without shake so it stays stable)
+    this.drawHUD();
+
+    // overlays
+    if (this.state === 'dead') {
+      this.drawOverlay('GAME OVER', 'Press R to restart');
+    } else if (this.state === 'win') {
+      this.drawOverlay('YOU WIN!', 'Press R to play again');
+    }
+  }
+
+  drawClouds() {
+    const parallax = 0.15;
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    const cloudData = [
+      [100, 50, 80, 30], [400, 30, 100, 35], [700, 70, 70, 25],
+      [1000, 40, 90, 30], [1400, 60, 110, 35], [1900, 35, 80, 28],
+      [2400, 55, 95, 32], [3000, 45, 85, 28], [3600, 65, 100, 30],
+      [4200, 38, 75, 26], [4800, 58, 90, 32], [5400, 42, 80, 30],
+    ];
+    for (const [cx, cy, cw, ch] of cloudData) {
+      const sx = cx - this.camera.x * parallax;
+      const wrapped = ((sx % (CANVAS_W + 200)) + CANVAS_W + 200) % (CANVAS_W + 200) - 100;
+      ctx.beginPath();
+      ctx.ellipse(wrapped, cy, cw / 2, ch / 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(wrapped - cw * 0.3, cy + 5, cw * 0.3, ch * 0.4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(wrapped + cw * 0.3, cy + 3, cw * 0.35, ch * 0.45, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  drawHills() {
+    const parallax = 0.3;
+    const groundY = (LEVEL_HEIGHT - 1) * TILE - this.camera.y * parallax * 0.5;
+    ctx.fillStyle = '#6aaa3a';
+    for (let i = 0; i < 20; i++) {
+      const hx = i * 300 - (this.camera.x * parallax) % 300;
+      const hh = 40 + (i * 37 % 30);
+      ctx.beginPath();
+      ctx.ellipse(hx + 150, CANVAS_H - (CANVAS_H - groundY) + 20, 160, hh, 0, Math.PI, 0);
+      ctx.fill();
+    }
+  }
+
+  drawHUD() {
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(8, 8, 200, 32);
+    ctx.fillStyle = '#FFD700';
+    ctx.font = 'bold 18px monospace';
+    ctx.fillText(`SCORE: ${this.score}`, 16, 30);
+    const coinCount = this.coins.filter(c => c.collected).length;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`COINS: ${coinCount}/${this.coins.length}`, 8, 56);
+  }
+
+  drawOverlay(title, subtitle) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(title, CANVAS_W / 2, CANVAS_H / 2 - 20);
+    ctx.font = '20px monospace';
+    ctx.fillText(subtitle, CANVAS_W / 2, CANVAS_H / 2 + 20);
+    ctx.fillText(`Final Score: ${this.score}`, CANVAS_W / 2, CANVAS_H / 2 + 55);
+    ctx.textAlign = 'left';
+  }
+
+  restart() {
+    Object.assign(this, new Game(this.sound));
+  }
+
+  loop() {
+    this.update();
+    this.draw();
+    requestAnimationFrame(() => this.loop());
+  }
+}
+
+// ── Start ──────────────────────────────────────────────────
+const sounds = new SoundManager();
+const game = new Game(sounds);
+game.loop();
+
+// ── Mute button wiring ─────────────────────────────────────
+const muteBtn = document.getElementById('muteBtn');
+muteBtn.addEventListener('click', () => {
+  const next = !sounds.muted;
+  sounds.setBGMMuted(next);
+  muteBtn.textContent = next ? '🔇 Music' : '🔊 Music';
+});
+</script>
+</body>
+</html>
